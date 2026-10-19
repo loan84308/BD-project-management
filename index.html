@@ -58,7 +58,16 @@ a{color:var(--brand);text-decoration:none;}
 }
 .brand .t1{font-size:16px;font-weight:700;line-height:1.25;}
 .brand .t2{font-size:12px;color:var(--ink-soft);}
-.top-actions{display:flex;gap:8px;flex-wrap:wrap;}
+.top-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+
+/* 雲端同步狀態標籤 */
+.cloud-status{
+  font-size:12px;font-weight:600;padding:4px 10px;border-radius:20px;
+  background:var(--gray-bg);color:var(--ink-soft);display:inline-flex;align-items:center;gap:5px;
+}
+.cloud-status.syncing{background:var(--amber-bg);color:var(--amber);}
+.cloud-status.synced{background:var(--green-bg);color:var(--green);}
+.cloud-status.error{background:var(--red-bg);color:var(--red);}
 
 .btn{
   border:1px solid var(--line);background:#fff;color:var(--ink);
@@ -144,7 +153,7 @@ table.tbl tbody tr:last-child td{border-bottom:none;}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
 
 /* ---------- Status switch (3-way) ---------- */
-.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#fff;}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:99px;overflow:hidden;background:#fff;}
 .seg button{
   border:0;background:#fff;padding:5px 12px;font-size:12.5px;font-weight:700;color:var(--ink-soft);
   border-right:1px solid var(--line-2);transition:.12s;
@@ -273,6 +282,7 @@ table.tbl tbody tr:last-child td{border-bottom:none;}
       </div>
     </div>
     <div class="top-actions">
+      <div id="cloudStatus" class="cloud-status">☁️ 雲端同步中</div>
       <button class="btn" id="btnHome">← 回首頁</button>
       <button class="btn" id="btnExport">匯出備份</button>
       <button class="btn" id="btnImport">匯入備份</button>
@@ -283,7 +293,7 @@ table.tbl tbody tr:last-child td{border-bottom:none;}
   <main id="view"></main>
 
   <div class="hint" style="text-align:center;margin-top:26px;">
-    資料自動儲存於本機瀏覽器（localStorage）。建議定期使用「匯出備份」保存 JSON 檔。
+    資料已實時同步至 JSONBin 雲端儲存，並同步備份於本機瀏覽器。建議定期使用「匯出備份」保存 JSON 檔。
   </div>
 </div>
 
@@ -295,6 +305,24 @@ table.tbl tbody tr:last-child td{border-bottom:none;}
 
 <script>
 /* ===== APP CODE START ===== */
+
+/* =========================================================
+   0. JSONBin.io 雲端設定
+   ========================================================= */
+const JSONBIN_ID = '6ad594e2ffd5d160537754c2';
+const JSONBIN_KEY = '$2a$10$3fJFyLvwqOx5BUFN3HGlDuaMUxV.wilbabBkhejINjGRXrCPGlOOq';
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_ID}`;
+
+/* Update status badge UI */
+function setCloudStatus(status, text) {
+  const el = document.getElementById("cloudStatus");
+  if (!el) return;
+  el.className = "cloud-status " + status;
+  if (status === "syncing") el.innerHTML = "🔄 " + (text || "同步中...");
+  else if (status === "synced") el.innerHTML = "☁️ " + (text || "已同步至雲端");
+  else if (status === "error") el.innerHTML = "⚠️ " + (text || "雲端連線失敗");
+  else el.innerHTML = "☁️ " + (text || "雲端準備就緒");
+}
 
 /* =========================================================
    1. 資料模型：9 階段與步驟
@@ -436,14 +464,12 @@ function caseDoneCount(c) {
   c.stages.forEach(st => st.steps.forEach(x => { if (x.status === "done") n++; }));
   return n;
 }
-/* 目前階段＝第一個尚未全部完成的階段；全部完成回傳最後一階段 */
 function currentStage(c) {
   for (let i = 0; i < c.stages.length; i++) {
     if (stageDoneCount(c, i) < c.stages[i].steps.length) return STAGE_NAMES[i];
   }
   return STAGE_NAMES[STAGE_NAMES.length - 1];
 }
-/* 案件狀態：未開始(0進度)／進行中／已完成(100%) */
 function caseStatus(c) {
   const p = caseProgress(c);
   if (p >= 1) return "done";
@@ -455,7 +481,6 @@ function caseStatusLabel(c) {
   return s === "done" ? "已完成" : (s === "none" ? "未開始" : "進行中");
 }
 
-/* 最近到期日：所有未完成且有日期之步驟中最小者 */
 function nextDue(c) {
   let min = null;
   c.stages.forEach(st => st.steps.forEach(s => {
@@ -465,7 +490,6 @@ function nextDue(c) {
   }));
   return min;
 }
-/* 逾期數：未完成、有日期、且日期 < 今天 */
 function overdueCount(c) {
   const t = todayISO();
   let n = 0;
@@ -474,7 +498,6 @@ function overdueCount(c) {
   }));
   return n;
 }
-/* 負責人彙總 */
 function ownersOf(c) {
   const m = {};
   c.stages.forEach(st => st.steps.forEach(s => {
@@ -485,40 +508,93 @@ function ownersOf(c) {
 }
 
 /* =========================================================
-   4. 狀態與儲存（localStorage）
+   4. 狀態與儲存（JSONBin + LocalStorage）
    ========================================================= */
 let state = { cases: [], view: "home", currentId: null };
 let filters = { q: "", stage: "all", status: "all" };
+let saveTimer = null;
 
+/* 將資料同步寫入 LocalStorage 與 JSONBin.io (帶防抖動功能) */
 function save() {
+  const payloadData = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    cases: state.cases
+  };
+
+  // 1. 本地備份
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      version: 1,
-      savedAt: new Date().toISOString(),
-      cases: state.cases
-    }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payloadData));
   } catch (e) {
-    console.warn("儲存失敗", e);
-    toast("資料儲存失敗，請確認瀏覽器允許本機儲存");
+    console.warn("本機儲存失敗", e);
   }
+
+  // 2. 雲端同步防抖處理
+  setCloudStatus("syncing", "同步中...");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(JSONBIN_URL, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_KEY
+        },
+        body: JSON.stringify(payloadData)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCloudStatus("synced", "已同步至雲端");
+    } catch (e) {
+      console.error("雲端同步失敗", e);
+      setCloudStatus("error", "雲端儲存失敗");
+    }
+  }, 800);
 }
 
-function load() {
+/* 優先從雲端載入，失敗時降級載入 LocalStorage */
+async function load() {
+  setCloudStatus("syncing", "雲端載入中...");
+  try {
+    const res = await fetch(`${JSONBIN_URL}/latest`, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': JSONBIN_KEY
+      }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const record = data.record;
+    if (record && Array.isArray(record.cases)) {
+      state.cases = record.cases.map(normalizeCase);
+      // 成功讀取後也備份至本地
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(record)); } catch(e){}
+      setCloudStatus("synced", "已同步至雲端");
+      return true;
+    }
+  } catch (e) {
+    console.warn("無法從雲端讀取，嘗試改用本機快取...", e);
+  }
+
+  // 降級使用 LocalStorage
   let raw = null;
   try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { raw = null; }
-  if (!raw) return false;
-  try {
-    const data = JSON.parse(raw);
-    if (!data || !Array.isArray(data.cases)) return false;
-    state.cases = data.cases.map(normalizeCase);
-    return true;
-  } catch (e) {
-    console.warn("讀取失敗", e);
-    return false;
+  if (raw) {
+    try {
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.cases)) {
+        state.cases = data.cases.map(normalizeCase);
+        setCloudStatus("error", "使用本機暫存檔");
+        return true;
+      }
+    } catch (e) {
+      console.warn("本機讀取失敗", e);
+    }
   }
+
+  setCloudStatus("error", "無法取得資料");
+  return false;
 }
 
-/* 匯入或載入時校正結構，確保 9 階段與步驟文字與範本一致 */
 function normalizeCase(c) {
   const out = {
     id: c.id || uid(),
@@ -555,7 +631,6 @@ function getCase(id) {
   return state.cases.filter(c => c.id === id)[0] || null;
 }
 
-/* 示範資料 */
 function seedDemo() {
   const t = new Date();
   const iso = (offset) => {
@@ -768,7 +843,6 @@ function renderHomeHTML() {
     '</div>' + compareCard;
 }
 
-/* 各案件整體完成率比較圖（自繪） */
 function compareChartHTML() {
   const arr = state.cases.slice().sort((a, b) => caseProgress(b) - caseProgress(a));
   return '<div class="bar-chart">' + arr.map(c => {
@@ -900,7 +974,6 @@ function statusColor(st) {
   return st === "done" ? "var(--green)" : (st === "none" ? "var(--gray)" : "var(--blue)");
 }
 
-/* 圓環圖（自繪 SVG） */
 function donutSVG(percent, size, stroke) {
   const r = (size - stroke) / 2;
   const cx = size / 2, cy = size / 2;
@@ -915,7 +988,6 @@ function donutSVG(percent, size, stroke) {
   '</svg>';
 }
 
-/* 各階段完成率長條圖 */
 function stageBarChartHTML(c) {
   return '<div class="bar-chart">' + c.stages.map((s, i) => {
     const p = pct(stageProgress(c, i));
@@ -928,7 +1000,6 @@ function stageBarChartHTML(c) {
   }).join("") + '</div>';
 }
 
-/* 單一階段區塊 */
 function stageHTML(c, i) {
   const s = c.stages[i];
   const p = pct(stageProgress(c, i));
@@ -949,7 +1020,6 @@ function stageHTML(c, i) {
   '</div>';
 }
 
-/* 單一步驟列 */
 function stepRowHTML(c, i, j, st) {
   const t = todayISO();
   const overdue = st.status !== "done" && st.due && st.due < t;
@@ -966,8 +1036,6 @@ function stepRowHTML(c, i, j, st) {
   '</div>';
 }
 
-
-
 /* =========================================================
    10. 明細頁事件與即時更新
    ========================================================= */
@@ -977,7 +1045,6 @@ function bindDetail(c) {
     state.view = "home"; state.currentId = null; window.scrollTo(0, 0); render();
   });
 
-  /* 基本資料欄位 */
   document.querySelectorAll("#view [data-field]").forEach(inp => {
     inp.addEventListener("input", function () {
       const key = this.getAttribute("data-field");
@@ -989,7 +1056,6 @@ function bindDetail(c) {
   const noteEl = document.getElementById("f_note");
   if (noteEl) noteEl.addEventListener("input", function () { c.note = this.value; save(); });
 
-  /* 展開／收合全部 */
   const ex = document.getElementById("dExpand");
   if (ex) ex.addEventListener("click", function () {
     c.stages.forEach(s => { s.open = true; });
@@ -1003,7 +1069,6 @@ function bindDetail(c) {
     document.querySelectorAll("#stagesWrap .stage").forEach(el => el.classList.remove("open"));
   });
 
-  /* 階段標題：展開切換 */
   document.querySelectorAll("#stagesWrap .stage-head").forEach(head => {
     head.addEventListener("click", function () {
       const idx = parseInt(this.getAttribute("data-toggle"), 10);
@@ -1014,13 +1079,11 @@ function bindDetail(c) {
     });
   });
 
-  /* 步驟列事件 */
   document.querySelectorAll("#stagesWrap .step-row").forEach(row => {
     const i = parseInt(row.getAttribute("data-i"), 10);
     const j = parseInt(row.getAttribute("data-j"), 10);
     const step = c.stages[i].steps[j];
 
-    /* 狀態三段切換 */
     row.querySelectorAll("[data-seg] button").forEach(btn => {
       btn.addEventListener("click", function (ev) {
         ev.stopPropagation();
@@ -1031,7 +1094,6 @@ function bindDetail(c) {
         row.classList.remove("is-done", "is-wip");
         if (s === "done") row.classList.add("is-done");
         if (s === "wip") row.classList.add("is-wip");
-        /* 移除／顯示逾期提示 */
         const txt = row.querySelector(".txt");
         const has = txt.querySelector(".overdue-txt");
         if (has) has.remove();
@@ -1040,11 +1102,9 @@ function bindDetail(c) {
       });
     });
 
-    /* 負責人 */
     const own = row.querySelector("[data-own]");
     if (own) own.addEventListener("input", function () { step.owner = this.value; save(); });
 
-    /* 預計完成日 */
     const due = row.querySelector("[data-due]");
     if (due) due.addEventListener("change", function () {
       step.due = this.value;
@@ -1053,7 +1113,6 @@ function bindDetail(c) {
     });
   });
 
-  /* 刪除案件（二次確認） */
   const del = document.getElementById("dDelete");
   if (del) del.addEventListener("click", function () {
     openModal(
@@ -1080,7 +1139,6 @@ function bindDetail(c) {
   });
 }
 
-/* 更新標題（客戶／編號／專案）而不重建輸入欄位 */
 function updateDetailTitles(c) {
   const h2 = document.querySelector(".detail-head h2");
   const sub = document.querySelector(".detail-head .muted");
@@ -1088,7 +1146,6 @@ function updateDetailTitles(c) {
   if (sub) sub.textContent = (c.code || "（未編號）") + (c.project ? " ・ " + c.project : "");
 }
 
-/* 重新計算並更新完成率與所有圖表 */
 function refreshDetail(c) {
   const p = pct(caseProgress(c));
   const st = caseStatus(c);
@@ -1114,7 +1171,6 @@ function refreshDetail(c) {
   const sc = document.getElementById("dStageChart");
   if (sc) sc.innerHTML = stageBarChartHTML(c);
 
-  /* 各階段標題的進度條與徽章 */
   document.querySelectorAll("#stagesWrap .stage").forEach(box => {
     const i = parseInt(box.getAttribute("data-stage"), 10);
     const sp = pct(stageProgress(c, i));
@@ -1282,13 +1338,13 @@ function bindGlobal() {
   });
 }
 
-function init() {
-  const ok = load();
+async function init() {
+  bindGlobal();
+  const ok = await load();
   if (!ok) {
     seedDemo();
     save();
   }
-  bindGlobal();
   render();
 }
 
@@ -1298,7 +1354,6 @@ if (document.readyState === "loading") {
   init();
 }
 /* ===== APP CODE END ===== */
-
 </script>
 </body>
 </html>
